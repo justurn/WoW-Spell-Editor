@@ -6,6 +6,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -16,6 +17,7 @@ namespace HeadlessExport
         static ConcurrentDictionary<int, string> _TaskNameLookup;
         static ConcurrentDictionary<int, int> _TaskProgressLookup;
         static ConcurrentDictionary<int, HeadlessDbc> _HeadlessDbcLookup;
+        static bool IsExporting = false;
 
         private static BlockingCollection<string> m_Queue = new BlockingCollection<string>();
 
@@ -39,12 +41,80 @@ namespace HeadlessExport
 
         static int PrioritiseSpellCompareBindings(Binding b1, Binding b2)
         {
-            if (b1.ToString().Contains("Spell$"))
+            if (b1.Name.Equals("Spell"))
                 return -1;
-            if (b2.ToString().Contains("Spell$"))
+            if (b2.Name.Equals("Spell"))
                 return 1;
-            
+
             return string.Compare(b1.ToString(), b2.ToString());
+        }
+
+        static int CompareLogEntry(LogEntry log1, LogEntry log2)
+        {
+            return log1.Name.CompareTo(log2.Name);
+        }
+
+        class LogEntry
+        {
+            public readonly int TaskId;
+            public readonly string Line;
+            public readonly int Progress;
+            public readonly string Name;
+
+            public LogEntry(int taskId, string line, int progress, string name)
+            {
+                TaskId = taskId;
+                Line = line;
+                Progress = progress;
+                Name = name;
+            }
+        }
+
+        static void PrintExportProgress()
+        {
+            var lines = new List<LogEntry>(_TaskNameLookup.Count);
+            foreach (var entry in _TaskProgressLookup)
+            {
+                var name = _TaskNameLookup.Keys.Contains(entry.Key) ? _TaskNameLookup[entry.Key] : string.Empty;
+                var dbc = _HeadlessDbcLookup.Keys.Contains(entry.Key) ? _HeadlessDbcLookup[entry.Key] : null;
+                var elapsedStr = dbc != null ? $"{Math.Round(dbc.Timer.Elapsed.TotalSeconds, 2)}s, " : string.Empty;
+                var nameStr = name.Length > 0 ? name : entry.Key.ToString();
+                var line = $" [{nameStr}] Export: {elapsedStr}{entry.Value}%";
+
+                lines.Add(new LogEntry(entry.Key, line, entry.Value, nameStr));
+            }
+
+            lines.Sort(CompareLogEntry);
+
+            var str = new StringBuilder(lines.Count * 50);
+            foreach (var line in lines)
+            {
+                str.AppendLine(line.Line);
+                if (line.Progress == 100)
+                {
+                    _TaskNameLookup.TryRemove(line.TaskId, out string _);
+                    _TaskProgressLookup.TryRemove(line.TaskId, out int _);
+                    _HeadlessDbcLookup.TryRemove(line.TaskId, out HeadlessDbc _);
+                }
+            }
+
+            WriteLine(str.ToString());
+        }
+
+        static void StartExportingLogger()
+        {
+            if (IsExporting)
+                return;
+
+            IsExporting = true;
+            Task.Run(() =>
+            {
+                while (IsExporting)
+                {
+                    Thread.Sleep(1000);
+                    PrintExportProgress();
+                }
+            });
         }
 
         static void Main(string[] args)
@@ -72,12 +142,28 @@ namespace HeadlessExport
                 exportWatch.Start();
                 var bindings = bindingManager.GetAllBindings();
                 Array.Sort(bindings, PrioritiseSpellCompareBindings);
+
+                bool spellDbcHasSoloAdapter = 
+                    adapters.Count > 1 && 
+                    bindings.Length > 0 && 
+                    bindings[0].Name.Equals("Spell");
+
+                var logLines = new Dictionary<int, List<string>>();
                 foreach (var binding in bindings)
                 {
-                    Console.WriteLine($"Exporting {binding.Name} using Adapter{adapterIndex + 1}...");
                     var adapter = adapters[adapterIndex++];
+                    bool updated = false;
                     if (adapterIndex >= adapters.Count)
-                        adapterIndex = 0;
+                    {
+                        updated = true;
+                        adapterIndex = spellDbcHasSoloAdapter ? 1 : 0;
+                    }
+
+                    int index = !updated ? adapterIndex + adapters.Count : 1;
+                    if (!logLines.ContainsKey(index))
+                        logLines.Add(index, new List<string>());
+                    logLines[index].Add(binding.Name);
+
                     var dbc = new HeadlessDbc();
                     var task = dbc.TimedExportToDBC(adapter, binding.Fields[0].Name, binding.Name, ImportExportType.DBC);
                     _TaskNameLookup.TryAdd(dbc.TaskId, binding.Name);
@@ -85,7 +171,16 @@ namespace HeadlessExport
                     _HeadlessDbcLookup.TryAdd(dbc.TaskId, dbc);
                     taskList.Add(task);
                 }
+
+                foreach (var entry in logLines)
+                {
+                    WriteLine($"- Adapter{entry.Key} exporting: [{string.Join(", ", entry.Value)}]");
+                }
+                logLines = null;
+
+                StartExportingLogger();
                 Task.WaitAll(taskList.ToArray());
+                IsExporting = false;
                 exportWatch.Stop();
                 taskList.Sort((x, y) => x.Result.ElapsedMilliseconds.CompareTo(y.Result.ElapsedMilliseconds));
                 taskList.ForEach(task =>
@@ -134,30 +229,18 @@ namespace HeadlessExport
         public static void SetProgress(double value, int taskId = 0)
         {
             int reportValue = Convert.ToInt32(value * 100D);
-            int id = Task.CurrentId.GetValueOrDefault(0);
-            var name = _TaskNameLookup.Keys.Contains(id) ? _TaskNameLookup[id] : string.Empty;
+            int id = taskId > 0 ? taskId : Task.CurrentId.GetValueOrDefault(0);
             if (_TaskProgressLookup.TryGetValue(id, out var savedProgress))
             {
-                if (reportValue > (savedProgress + 5))
+                if (reportValue > savedProgress)
                 {
-                    if (_TaskProgressLookup.TryUpdate(id, reportValue, savedProgress))
-                    {
-                        LogProgress(name, id, reportValue);
-                    }
+                    _TaskProgressLookup.TryUpdate(id, reportValue, savedProgress);
                 }
             }
             else
             {
                 _TaskProgressLookup.TryAdd(id, reportValue);
             }
-        }
-
-        public static void LogProgress(string name, int id, int reportValue)
-        {
-            var dbc = _HeadlessDbcLookup.Keys.Contains(id) ? _HeadlessDbcLookup[id] : null;
-            var elapsedStr = dbc != null ? $"{Math.Round(dbc.Timer.Elapsed.TotalSeconds, 2)}s, " : string.Empty;
-            var nameStr = name.Length > 0 ? name : id.ToString();
-            WriteLine($" [{nameStr}] Export: {elapsedStr}{reportValue}%");
         }
     }
 }

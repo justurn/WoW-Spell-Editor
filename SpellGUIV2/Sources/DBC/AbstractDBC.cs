@@ -207,6 +207,7 @@ namespace SpellEditor.Sources.DBC
                         writer.Write(Encoding.UTF8.GetBytes(body.ReverseStorage[offsetsStored[i]] + "\0"));
                 }
             }
+            updateProgress(1);
         }
 
         protected string GetAllLocaleStringsForField(string fieldName, Dictionary<string, object> record)
